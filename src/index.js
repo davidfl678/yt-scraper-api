@@ -5,6 +5,12 @@ const CORS_HEADERS = {
   "Access-Control-Expose-Headers": "Content-Length, Content-Range, Content-Disposition"
 };
 
+const THIRD_PARTY_MIRRORS = [
+  { name: "mirror-1", base: "https://cobaltapi.cjs.nz" },
+  { name: "mirror-2", base: "https://rue-cobalt.xenon.zone" },
+  { name: "mirror-3", base: "https://p.savenow.to" }
+];
+
 function json(data, status = 200) {
   return new Response(JSON.stringify(data, null, 2), {
     status,
@@ -13,6 +19,11 @@ function json(data, status = 200) {
       ...CORS_HEADERS
     }
   });
+}
+
+function sanitizeFilename(name) {
+  if (!name || typeof name !== "string") return "youtube_media";
+  return name.replace(/[\\/:*?"<>|\r\n]+/g, "_").trim().slice(0, 100);
 }
 
 function extractVideoId(input) {
@@ -56,81 +67,145 @@ async function fetchInnertube(videoId) {
   return data;
 }
 
-async function fetchThirdParty(ytUrl, requestedQuality) {
-  const mirrors = [
-    "https://rue-cobalt.xenon.zone",
-    "https://cobaltapi.cjs.nz"
-  ];
+async function resolveFromCobalt(mirrorBase, videoId, cleanQuality, isAudio) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 4500);
 
-  const targetQuality = ["360", "480", "720", "1080", "1440", "2160"].includes(String(requestedQuality))
-    ? String(requestedQuality)
+  const payload = {
+    url: `https://www.youtube.com/watch?v=${videoId}`,
+    youtubeVideoCodec: "h264"
+  };
+
+  if (isAudio) {
+    payload.downloadMode = "audio";
+    payload.audioFormat = "mp3";
+  } else {
+    payload.videoQuality = cleanQuality;
+  }
+
+  try {
+    const res = await fetch(`${mirrorBase}/`, {
+      method: "POST",
+      headers: {
+        "Accept": "application/json",
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify(payload),
+      signal: controller.signal
+    });
+    clearTimeout(timer);
+
+    if (!res.ok) return null;
+    const data = await res.json();
+    if (data && (data.status === "tunnel" || data.status === "redirect") && data.url) {
+      return data.url;
+    }
+  } catch {
+    clearTimeout(timer);
+  }
+  return null;
+}
+
+async function resolveFromSaveNow(videoId, cleanQuality, isAudio) {
+  const format = isAudio ? "mp3" : cleanQuality;
+  const url = `https://p.savenow.to/ajax/download.php?format=${format}&url=${encodeURIComponent(`https://www.youtube.com/watch?v=${videoId}`)}`;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 4000);
+
+  try {
+    const res = await fetch(url, {
+      headers: { "User-Agent": "Mozilla/5.0" },
+      signal: controller.signal
+    });
+    clearTimeout(timer);
+    if (!res.ok) return null;
+    const data = await res.json();
+    if (data?.url) return data.url;
+    if (data?.progress_url) {
+      for (let i = 0; i < 4; i++) {
+        await new Promise(r => setTimeout(r, 600));
+        const pRes = await fetch(data.progress_url, { headers: { "User-Agent": "Mozilla/5.0" } });
+        if (pRes.ok) {
+          const pData = await pRes.json();
+          if (pData?.success === 1 && pData?.download_url) {
+            return pData.download_url;
+          }
+        }
+      }
+    }
+  } catch {
+    clearTimeout(timer);
+  }
+  return null;
+}
+
+async function resolveMediaStream(videoId, requestedQuality, isAudio) {
+  const cleanQ = ["360", "480", "720", "1080", "1440", "2160"].includes(String(requestedQuality).replace("p", ""))
+    ? String(requestedQuality).replace("p", "")
     : "1080";
 
-  for (const mirror of mirrors) {
+  for (const mirror of THIRD_PARTY_MIRRORS) {
+    if (mirror.base.includes("savenow.to")) {
+      const url = await resolveFromSaveNow(videoId, cleanQ, isAudio);
+      if (url) return { source: mirror.name, url, quality: `${cleanQ}p` };
+    } else {
+      const url = await resolveFromCobalt(mirror.base, videoId, cleanQ, isAudio);
+      if (url) return { source: mirror.name, url, quality: `${cleanQ}p` };
+    }
+  }
+
+  try {
+    const itData = await fetchInnertube(videoId);
+    const streaming = itData.streamingData || {};
+    if (isAudio) {
+      const audioFormats = (streaming.adaptiveFormats || []).filter(f => f.mimeType?.startsWith("audio/"));
+      const bestAudio = audioFormats.find(f => f.audioQuality === "AUDIO_QUALITY_MEDIUM") || audioFormats[0] || null;
+      if (bestAudio?.url) {
+        return { source: "innertube-android", url: bestAudio.url, quality: "m4a" };
+      }
+    } else {
+      const progFormat = streaming.formats?.[0] || null;
+      if (progFormat?.url) {
+        return { source: "innertube-android", url: progFormat.url, quality: progFormat.qualityLabel || "360p" };
+      }
+    }
+  } catch {}
+
+  return null;
+}
+
+async function fetchThirdPartyBatch(videoId, cleanQuality) {
+  for (const mirror of THIRD_PARTY_MIRRORS) {
+    if (mirror.base.includes("savenow.to")) {
+      continue;
+    }
     try {
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), 6000);
-
-      const [videoRes, audioRes] = await Promise.allSettled([
-        fetch(`${mirror}/`, {
-          method: "POST",
-          headers: {
-            "Accept": "application/json",
-            "Content-Type": "application/json"
-          },
-          body: JSON.stringify({ url: ytUrl, videoQuality: targetQuality }),
-          signal: controller.signal
-        }),
-        fetch(`${mirror}/`, {
-          method: "POST",
-          headers: {
-            "Accept": "application/json",
-            "Content-Type": "application/json"
-          },
-          body: JSON.stringify({ url: ytUrl, downloadMode: "audio", audioFormat: "mp3" }),
-          signal: controller.signal
-        })
+      const [videoUrl, audioUrl] = await Promise.all([
+        resolveFromCobalt(mirror.base, videoId, cleanQuality, false),
+        resolveFromCobalt(mirror.base, videoId, cleanQuality, true)
       ]);
-
-      clearTimeout(timer);
-
-      let videoUrl = null;
-      let audioUrl = null;
-
-      if (videoRes.status === "fulfilled" && videoRes.value.ok) {
-        const vJson = await videoRes.value.json();
-        if (vJson.status === "tunnel" || vJson.status === "redirect") {
-          videoUrl = vJson.url;
-        }
-      }
-
-      if (audioRes.status === "fulfilled" && audioRes.value.ok) {
-        const aJson = await audioRes.value.json();
-        if (aJson.status === "tunnel" || aJson.status === "redirect") {
-          audioUrl = aJson.url;
-        }
-      }
-
       if (videoUrl || audioUrl) {
         return {
-          mirror,
-          quality: `${targetQuality}p`,
+          mirror: mirror.name,
+          base: mirror.base,
+          quality: `${cleanQuality}p`,
           videoUrl,
           audioUrl
         };
       }
-    } catch {
-    }
+    } catch {}
   }
   return null;
 }
 
 async function scrapeYouTube(videoId, requestedQuality, origin) {
-  const ytUrl = `https://www.youtube.com/watch?v=${videoId}`;
+  const cleanQ = ["360", "480", "720", "1080", "1440", "2160"].includes(String(requestedQuality).replace("p", ""))
+    ? String(requestedQuality).replace("p", "")
+    : "1080";
 
   const [innertubeResult, thirdPartyResult] = await Promise.allSettled([
     fetchInnertube(videoId),
-    fetchThirdParty(ytUrl, requestedQuality)
+    fetchThirdPartyBatch(videoId, cleanQ)
   ]);
 
   if (innertubeResult.status !== "fulfilled") {
@@ -156,6 +231,8 @@ async function scrapeYouTube(videoId, requestedQuality, origin) {
   const primaryAudioDownload = mp3Url || directAudioUrl;
   const activeQuality = tp?.quality || (progFormat?.qualityLabel || "360p");
 
+  const cleanTitle = sanitizeFilename(details.title || `youtube_${videoId}`);
+
   const thumbnails = details.thumbnail?.thumbnails || [
     { url: `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`, width: 480, height: 360 }
   ];
@@ -172,53 +249,35 @@ async function scrapeYouTube(videoId, requestedQuality, origin) {
     views: Number(details.viewCount || 0),
     is_live: Boolean(details.isLiveContent),
     thumbnails,
+    requested_quality: `${cleanQ}p`,
     available_qualities: ["1080p", "720p", "480p", "360p", "mp3"],
+    mirrors: {
+      active: tp ? tp.mirror : "innertube-android",
+      mirror_1: "cobaltapi.cjs.nz",
+      mirror_2: "rue-cobalt.xenon.zone",
+      mirror_3: "p.savenow.to",
+      fallback: "innertube-android"
+    },
     media: {
       video: {
         quality: activeQuality,
         url: primaryVideoDownload,
         fallback_360p_url: directMp4Url,
-        download_url: primaryVideoDownload
-          ? `${origin}/api/download?url=${encodeURIComponent(primaryVideoDownload)}&filename=youtube_${videoId}_${activeQuality}.mp4`
-          : null,
-        stream_url: (directMp4Url || primaryVideoDownload)
-          ? `${origin}/api/stream?url=${encodeURIComponent(directMp4Url || primaryVideoDownload)}`
-          : null
+        download_url: `${origin}/api/download?id=${videoId}&quality=${cleanQ}&type=video&filename=${encodeURIComponent(cleanTitle + "_" + cleanQ + "p.mp4")}`,
+        stream_url: `${origin}/api/stream?id=${videoId}&quality=${cleanQ}&type=video`
       },
       audio: {
         format: mp3Url ? "mp3" : "m4a",
         url: primaryAudioDownload,
         fallback_url: directAudioUrl,
-        download_url: primaryAudioDownload
-          ? `${origin}/api/download?url=${encodeURIComponent(primaryAudioDownload)}&filename=youtube_audio_${videoId}.${mp3Url ? "mp3" : "m4a"}`
-          : null,
-        stream_url: (directAudioUrl || primaryAudioDownload)
-          ? `${origin}/api/stream?url=${encodeURIComponent(directAudioUrl || primaryAudioDownload)}`
-          : null
+        download_url: `${origin}/api/download?id=${videoId}&type=audio&filename=${encodeURIComponent(cleanTitle + "_audio." + (mp3Url ? "mp3" : "m4a"))}`,
+        stream_url: `${origin}/api/stream?id=${videoId}&type=audio`
       }
     }
   };
 }
 
-async function handleProxy(request, asAttachment) {
-  const reqUrl = new URL(request.url);
-  const targetUrl = reqUrl.searchParams.get("url");
-  const filename = reqUrl.searchParams.get("filename") || "youtube_media.mp4";
-
-  if (!targetUrl) {
-    return json({ status: "error", message: "Missing 'url' query parameter" }, 400);
-  }
-
-  let parsedTarget;
-  try {
-    parsedTarget = new URL(targetUrl);
-    if (!["http:", "https:"].includes(parsedTarget.protocol)) {
-      throw new Error("Invalid protocol");
-    }
-  } catch {
-    return json({ status: "error", message: "Invalid media URL" }, 400);
-  }
-
+async function pipeStream(targetUrl, request, filename, asAttachment) {
   const upstreamHeaders = {
     "User-Agent": "com.google.android.youtube/20.34.37 (Linux; U; Android 11) gzip"
   };
@@ -228,38 +287,78 @@ async function handleProxy(request, asAttachment) {
     upstreamHeaders["Range"] = range;
   }
 
-  try {
-    const upstream = await fetch(parsedTarget.toString(), {
-      method: "GET",
-      headers: upstreamHeaders
-    });
+  const upstream = await fetch(targetUrl, {
+    method: "GET",
+    headers: upstreamHeaders
+  });
 
-    const responseHeaders = new Headers(CORS_HEADERS);
-    const contentType = upstream.headers.get("content-type") || (filename.endsWith(".mp3") ? "audio/mpeg" : (filename.endsWith(".m4a") ? "audio/mp4" : "video/mp4"));
-    responseHeaders.set("Content-Type", contentType);
+  const responseHeaders = new Headers(CORS_HEADERS);
+  const isAudioFile = filename.endsWith(".mp3") || filename.endsWith(".m4a");
+  const fallbackType = isAudioFile ? (filename.endsWith(".mp3") ? "audio/mpeg" : "audio/mp4") : "video/mp4";
+  const contentType = upstream.headers.get("content-type") || fallbackType;
+  responseHeaders.set("Content-Type", contentType);
 
-    const contentLength = upstream.headers.get("content-length");
-    if (contentLength) responseHeaders.set("Content-Length", contentLength);
+  const contentLength = upstream.headers.get("content-length");
+  if (contentLength) responseHeaders.set("Content-Length", contentLength);
 
-    const contentRange = upstream.headers.get("content-range");
-    if (contentRange) responseHeaders.set("Content-Range", contentRange);
+  const contentRange = upstream.headers.get("content-range");
+  if (contentRange) responseHeaders.set("Content-Range", contentRange);
 
-    const acceptRanges = upstream.headers.get("accept-ranges");
-    if (acceptRanges) responseHeaders.set("Accept-Ranges", acceptRanges);
+  const acceptRanges = upstream.headers.get("accept-ranges");
+  if (acceptRanges) responseHeaders.set("Accept-Ranges", acceptRanges);
 
-    responseHeaders.set(
-      "Content-Disposition",
-      asAttachment ? `attachment; filename="${filename}"` : "inline"
-    );
-    responseHeaders.set("Cache-Control", "public, max-age=86400");
+  responseHeaders.set(
+    "Content-Disposition",
+    asAttachment ? `attachment; filename="${filename}"` : "inline"
+  );
+  responseHeaders.set("Cache-Control", "public, max-age=86400");
 
-    return new Response(upstream.body, {
-      status: upstream.status,
-      headers: responseHeaders
-    });
-  } catch (err) {
-    return json({ status: "error", message: `Proxy error: ${err.message}` }, 502);
+  return new Response(upstream.body, {
+    status: upstream.status,
+    headers: responseHeaders
+  });
+}
+
+async function handleProxy(request, asAttachment) {
+  const reqUrl = new URL(request.url);
+  const rawId = reqUrl.searchParams.get("id");
+  const rawUrl = reqUrl.searchParams.get("url");
+  const videoId = rawId || extractVideoId(rawUrl);
+  const quality = reqUrl.searchParams.get("quality") || reqUrl.searchParams.get("q") || "1080";
+  const type = reqUrl.searchParams.get("type") || "video";
+  const isAudio = type === "audio" || quality === "mp3";
+
+  let filename = reqUrl.searchParams.get("filename");
+  if (!filename) {
+    filename = isAudio
+      ? `youtube_audio_${videoId || "media"}.mp3`
+      : `youtube_${videoId || "media"}_${quality}.mp4`;
   }
+  filename = sanitizeFilename(filename);
+
+  if (videoId) {
+    const resolved = await resolveMediaStream(videoId, quality, isAudio);
+    if (resolved && resolved.url) {
+      try {
+        return await pipeStream(resolved.url, request, filename, asAttachment);
+      } catch {}
+    }
+  }
+
+  if (rawUrl) {
+    let parsedTarget;
+    try {
+      parsedTarget = new URL(rawUrl);
+      if (!["http:", "https:"].includes(parsedTarget.protocol)) {
+        throw new Error("Invalid protocol");
+      }
+      return await pipeStream(parsedTarget.toString(), request, filename, asAttachment);
+    } catch (err) {
+      return json({ status: "error", message: `Proxy error: ${err.message}` }, 502);
+    }
+  }
+
+  return json({ status: "error", message: "Missing video 'id' or 'url' parameter" }, 400);
 }
 
 export default {
@@ -279,31 +378,43 @@ export default {
       return json({
         status: "online",
         service: "YouTube Scraper & Downloader API",
-        version: "1.1.0",
+        version: "2.0.0",
+        mirrors: [
+          { name: "mirror-1", host: "cobaltapi.cjs.nz", status: "active" },
+          { name: "mirror-2", host: "rue-cobalt.xenon.zone", status: "active" },
+          { name: "mirror-3", host: "p.savenow.to", status: "standby" },
+          { name: "fallback", host: "youtubei.googleapis.com", status: "standby" }
+        ],
         endpoints: {
           scrape: {
             method: ["GET", "POST"],
             path: "/api/scrape",
             params: {
               url: "YouTube video URL (watch/shorts/youtu.be) or 11-char video ID",
-              quality: "Optional video resolution: 1080, 720, 480, 360 (default: 1080)"
+              quality: "Target resolution: 1080, 720, 480, 360 (default: 1080)"
             },
-            example: `${origin}/api/scrape?url=https://www.youtube.com/watch?v=dQw4w9WgXcQ&quality=1080`
+            example: `${origin}/api/scrape?url=https://www.youtube.com/watch?v=dQw4w9WgXcQ&quality=720`
           },
           download: {
             method: "GET",
             path: "/api/download",
             params: {
-              url: "Direct media URL",
-              filename: "Optional output filename (default: youtube_media.mp4)"
-            }
+              id: "11-char YouTube video ID",
+              quality: "Resolution: 1080, 720, 480, 360",
+              type: "Media type: video or audio (default: video)",
+              filename: "Optional custom output filename"
+            },
+            example: `${origin}/api/download?id=dQw4w9WgXcQ&quality=720&type=video`
           },
           stream: {
             method: "GET",
             path: "/api/stream",
             params: {
-              url: "Direct media URL"
-            }
+              id: "11-char YouTube video ID",
+              quality: "Resolution: 1080, 720, 480, 360",
+              type: "Media type: video or audio (default: video)"
+            },
+            example: `${origin}/api/stream?id=dQw4w9WgXcQ&quality=720`
           },
           health: {
             method: "GET",
