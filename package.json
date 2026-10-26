@@ -1,0 +1,14 @@
+{
+  "name": "youtube-scraper-api",
+  "version": "1.0.0",
+  "description": "High-performance YouTube scraper and downloader API for Cloudflare Workers",
+  "main": "src/index.js",
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev --ip 0.0.0.0 --port 8788",
+    "deploy": "wrangler deploy"
+  },
+  "devDependencies": {
+    "wrangler": "^3.114.0"
+  }
+}
