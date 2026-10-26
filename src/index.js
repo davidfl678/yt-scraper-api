@@ -39,37 +39,61 @@ function extractVideoId(input) {
 async function fetchInnertube(videoId) {
   const key = "AIzaSyA8eiZmM1FaDVjRy-df2KTyQ_vz_yYM39w";
   const url = `https://www.youtube.com/youtubei/v1/player?key=${key}`;
-  const res = await fetch(url, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "User-Agent": "com.google.android.youtube/20.34.37 (Linux; U; Android 11) gzip"
-    },
-    body: JSON.stringify({
-      videoId,
-      context: {
-        client: {
-          clientName: "ANDROID",
-          clientVersion: "20.34.37",
-          androidSdkVersion: 30,
-          hl: "en",
-          gl: "US"
+  try {
+    const res = await fetch(url, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "User-Agent": "com.google.android.youtube/20.34.37 (Linux; U; Android 11) gzip"
+      },
+      body: JSON.stringify({
+        videoId,
+        context: {
+          client: {
+            clientName: "ANDROID",
+            clientVersion: "20.34.37",
+            androidSdkVersion: 30,
+            hl: "en",
+            gl: "US"
+          }
         }
-      }
-    })
-  });
-
-  if (!res.ok) throw new Error(`YouTube API returned status ${res.status}`);
-  const data = await res.json();
-  if (data.playabilityStatus?.status !== "OK") {
-    throw new Error(data.playabilityStatus?.reason || "Video unavailable");
+      })
+    });
+    if (!res.ok) return null;
+    const data = await res.json();
+    if (data.playabilityStatus?.status !== "OK") return null;
+    return data;
+  } catch {
+    return null;
   }
-  return data;
+}
+
+async function fetchOEmbed(videoId) {
+  try {
+    const res = await fetch(`https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v=${videoId}&format=json`, {
+      headers: { "User-Agent": "Mozilla/5.0" }
+    });
+    if (res.ok) return await res.json();
+  } catch {}
+  return null;
+}
+
+async function fetchPrexzy(videoId) {
+  try {
+    const res = await fetch(`https://prexzyapis.com/download/ytmp4?url=${encodeURIComponent(`https://www.youtube.com/watch?v=${videoId}`)}`, {
+      headers: { "User-Agent": "Mozilla/5.0" }
+    });
+    if (res.ok) {
+      const data = await res.json();
+      if (data && (data.info || data.qualities)) return data;
+    }
+  } catch {}
+  return null;
 }
 
 async function fetchFromEdgeDownloader(videoId) {
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 26000);
+  const timer = setTimeout(() => controller.abort(), 12000);
   try {
     const target = `https://yt-dl.officialhectormanuel.workers.dev/?url=${encodeURIComponent(`https://www.youtube.com/watch?v=${videoId}`)}`;
     const res = await fetch(target, {
@@ -92,7 +116,7 @@ async function resolveFromSaveNow(videoId, cleanQuality, isAudio) {
   const format = isAudio ? "mp3" : cleanQuality;
   const target = `https://p.savenow.to/api/v2/download?format=${format}&url=${encodeURIComponent(`https://www.youtube.com/watch?v=${videoId}`)}`;
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 8000);
+  const timer = setTimeout(() => controller.abort(), 10000);
   try {
     const res = await fetch(target, {
       headers: { "User-Agent": "Mozilla/5.0" },
@@ -145,8 +169,8 @@ async function resolveMediaStream(videoId, requestedQuality, isAudio) {
     return { source: "engine-2", url: snUrl, quality: isAudio ? "mp3" : `${cleanQ}p` };
   }
 
-  try {
-    const itData = await fetchInnertube(videoId);
+  const itData = await fetchInnertube(videoId);
+  if (itData) {
     const streaming = itData.streamingData || {};
     if (isAudio) {
       const audioFormats = (streaming.adaptiveFormats || []).filter(f => f.mimeType?.startsWith("audio/"));
@@ -160,7 +184,7 @@ async function resolveMediaStream(videoId, requestedQuality, isAudio) {
         return { source: "fallback", url: progFormat.url, quality: progFormat.qualityLabel || "360p" };
       }
     }
-  } catch {}
+  }
 
   return null;
 }
@@ -170,23 +194,34 @@ async function scrapeYouTube(videoId, requestedQuality, origin) {
     ? String(requestedQuality).replace("p", "")
     : "1080";
 
-  const [edgeResult, itResult] = await Promise.allSettled([
+  const [edgeResult, itResult, oembedResult, prexzyResult] = await Promise.allSettled([
     fetchFromEdgeDownloader(videoId),
-    fetchInnertube(videoId)
+    fetchInnertube(videoId),
+    fetchOEmbed(videoId),
+    fetchPrexzy(videoId)
   ]);
 
   const edgeData = edgeResult.status === "fulfilled" ? edgeResult.value : null;
   const itData = itResult.status === "fulfilled" ? itResult.value : null;
+  const oembed = oembedResult.status === "fulfilled" ? oembedResult.value : null;
+  const prexzy = prexzyResult.status === "fulfilled" ? prexzyResult.value : null;
 
-  if (!edgeData && !itData) {
+  if (!edgeData && !itData && !oembed && !prexzy) {
     throw new Error("Unable to retrieve YouTube video data from available engines");
   }
 
+  const pInfo = prexzy?.info || {};
   const details = itData?.videoDetails || {};
   const streaming = itData?.streamingData || {};
 
-  const title = edgeData?.title || details.title || `youtube_${videoId}`;
+  const title = edgeData?.title || pInfo.title || details.title || oembed?.title || `youtube_${videoId}`;
   const cleanTitle = sanitizeFilename(title);
+
+  const author = details.author || pInfo.channel || pInfo.uploader || oembed?.author_name || edgeData?.creator || "";
+  const channelId = details.channelId || pInfo.id || "";
+  const duration = Number(details.lengthSeconds || pInfo.duration || 0);
+  const views = Number(details.viewCount || pInfo.view_count || 0);
+  const isLive = Boolean(details.isLiveContent);
 
   const progFormat = streaming.formats?.[0] || null;
   const audioFormats = (streaming.adaptiveFormats || []).filter(f => f.mimeType?.startsWith("audio/"));
@@ -219,9 +254,11 @@ async function scrapeYouTube(videoId, requestedQuality, origin) {
 
   const thumbnails = details.thumbnail?.thumbnails?.length
     ? details.thumbnail.thumbnails
-    : edgeData?.thumbnail
-      ? [{ url: edgeData.thumbnail, width: 480, height: 360 }]
-      : [{ url: `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`, width: 480, height: 360 }];
+    : (pInfo.thumbnail
+      ? [{ url: pInfo.thumbnail, width: 480, height: 360 }]
+      : (edgeData?.thumbnail
+        ? [{ url: edgeData.thumbnail, width: 480, height: 360 }]
+        : [{ url: oembed?.thumbnail_url || `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`, width: 480, height: 360 }]));
 
   const videoDownloadUrl = primaryVideoUrl
     ? `${origin}/api/download?url=${encodeURIComponent(primaryVideoUrl)}&filename=${encodeURIComponent(cleanTitle + "_" + cleanQ + "p.mp4")}`
@@ -240,21 +277,21 @@ async function scrapeYouTube(videoId, requestedQuality, origin) {
     : `${origin}/api/stream?id=${videoId}&type=audio`;
 
   return {
-    engine: edgeData ? "engine-1 (edge-ytdl)" : "fallback (innertube)",
+    engine: edgeData ? "engine-1 (edge-ytdl)" : (itData ? "fallback (innertube)" : "engine-2 (savenow)"),
     id: videoId,
     title,
     channel: {
-      id: details.channelId || "",
-      name: details.author || edgeData?.creator || ""
+      id: channelId,
+      name: author
     },
-    duration: Number(details.lengthSeconds || 0),
-    views: Number(details.viewCount || 0),
-    is_live: Boolean(details.isLiveContent),
+    duration,
+    views,
+    is_live: isLive,
     thumbnails,
     requested_quality: `${cleanQ}p`,
     available_qualities: edgeData?.available_qualities || ["1080p", "720p", "480p", "360p", "mp3"],
     engines: {
-      active: edgeData ? "engine-1" : "fallback",
+      active: edgeData ? "engine-1" : (itData ? "fallback" : "engine-2"),
       engine_1: "yt-dl.officialhectormanuel.workers.dev",
       engine_2: "p.savenow.to",
       fallback: "innertube-android"
@@ -262,14 +299,14 @@ async function scrapeYouTube(videoId, requestedQuality, origin) {
     media: {
       video: {
         quality: activeQuality,
-        url: primaryVideoUrl,
+        url: primaryVideoUrl || videoDownloadUrl,
         qualities: Object.keys(qualities).length ? qualities : null,
         download_url: videoDownloadUrl,
         stream_url: videoStreamUrl
       },
       audio: {
         format: edgeData?.audio ? "mp3" : "m4a",
-        url: primaryAudioUrl,
+        url: primaryAudioUrl || audioDownloadUrl,
         download_url: audioDownloadUrl,
         stream_url: audioStreamUrl
       }
