@@ -5,10 +5,13 @@ const CORS_HEADERS = {
   "Access-Control-Expose-Headers": "Content-Length, Content-Range, Content-Disposition"
 };
 
+const MAX_DOWNLOAD_BYTES = 650 * 1024 * 1024;
+
 const ENGINES = [
-  { name: "engine-1", host: "yt-dl.officialhectormanuel.workers.dev" },
-  { name: "engine-2", host: "p.savenow.to" },
-  { name: "fallback", host: "youtubei.googleapis.com" }
+  { name: "engine-1", host: "yt-dl.officialhectormanuel.workers.dev", status: "active" },
+  { name: "engine-2", host: "ytmp3.biz.pl", status: "active" },
+  { name: "engine-3", host: "p.savenow.to", status: "standby" },
+  { name: "fallback", host: "youtubei.googleapis.com", status: "standby" }
 ];
 
 function json(data, status = 200) {
@@ -34,6 +37,59 @@ function extractVideoId(input) {
   }
   const match = trimmed.match(/(?:youtu\.be\/|youtube\.com\/(?:embed\/|v\/|watch\?v=|watch\?.+&v=|shorts\/))([a-zA-Z0-9_-]{11})/i);
   return match ? match[1] : null;
+}
+
+function formatBytesNumber(bytes) {
+  if (!bytes || bytes <= 0) return null;
+  const units = ["Bytes", "KB", "MB", "GB", "TB"];
+  const i = Math.floor(Math.log(bytes) / Math.log(1024));
+  return `${parseFloat((bytes / Math.pow(1024, i)).toFixed(2))} ${units[i]}`;
+}
+
+function formatBitrateBytes(bitrateKbps, durationSec) {
+  if (!durationSec) return null;
+  const bytes = (bitrateKbps * 1000 * durationSec) / 8;
+  const units = ["Bytes", "KB", "MB", "GB"];
+  const i = Math.floor(Math.log(bytes) / Math.log(1024));
+  return `${parseFloat((bytes / Math.pow(1024, i)).toFixed(2))} ${units[i]}`;
+}
+
+function findQualitySize(qStr, jarVids, itData) {
+  const qNum = String(qStr).match(/(\d+)/)?.[1];
+  if (!qNum) return { size: null, size_formatted: null };
+
+  if (Array.isArray(jarVids)) {
+    const jarMatch = jarVids.find(v => {
+      const vNum = String(v.quality || "").match(/(\d+)/)?.[1];
+      return vNum === qNum;
+    });
+    if (jarMatch && typeof jarMatch.size === "number") {
+      return {
+        size: Math.round(jarMatch.size),
+        size_formatted: jarMatch.sizeLabel || formatBytesNumber(jarMatch.size)
+      };
+    }
+  }
+
+  if (itData?.streamingData) {
+    const allFormats = [
+      ...(itData.streamingData.formats || []),
+      ...(itData.streamingData.adaptiveFormats || [])
+    ];
+    const itMatch = allFormats.find(f => {
+      const fNum = String(f.qualityLabel || f.quality || "").match(/(\d+)/)?.[1];
+      return fNum === qNum && f.contentLength;
+    });
+    if (itMatch) {
+      const numBytes = Number(itMatch.contentLength);
+      return {
+        size: numBytes,
+        size_formatted: formatBytesNumber(numBytes)
+      };
+    }
+  }
+
+  return { size: null, size_formatted: null };
 }
 
 async function fetchInnertube(videoId) {
@@ -91,9 +147,130 @@ async function fetchPrexzy(videoId) {
   return null;
 }
 
+async function fetchYtMp3BizPl(videoId, origin) {
+  try {
+    const [pageRes, jarInfoRes, jarFormatsRes] = await Promise.allSettled([
+      fetch(`https://ytmp3.biz.pl/?q=${encodeURIComponent(`https://www.youtube.com/watch?v=${videoId}`)}`, {
+        headers: {
+          "HX-Request": "true",
+          "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+          "Referer": "https://ytmp3.biz.pl/"
+        }
+      }),
+      fetch(`https://v2.y2jar.cc/i/${videoId}`, {
+        headers: { "Accept": "application/json", "Referer": `https://v2.y2jar.cc/?id=${videoId}` }
+      }),
+      fetch(`https://v2.y2jar.cc/f/${videoId}`, {
+        headers: { "Accept": "application/json", "Referer": `https://v2.y2jar.cc/?id=${videoId}` }
+      })
+    ]);
+
+    let html = "";
+    if (pageRes.status === "fulfilled" && pageRes.value.ok) {
+      html = await pageRes.value.text();
+    }
+
+    const jarInfo = jarInfoRes.status === "fulfilled" && jarInfoRes.value.ok ? await jarInfoRes.value.json() : null;
+    const jarFormats = jarFormatsRes.status === "fulfilled" && jarFormatsRes.value.ok ? await jarFormatsRes.value.json() : null;
+
+    const titleMatch = html.match(/<h1[^>]*>([^<]+)<\/h1>/i);
+    const infoMatch = html.match(/<div class="-mb-1 text-gray-500[^>]*>([^<]+)<\/div>/i);
+    const iframeMatch = html.match(/<iframe[^>]+src="([^"]+)"[^>]*>/i);
+    const thumbMatch = html.match(/<img[^>]+class="[^"]*rounded-lg[^"]*"[^>]+src="([^"]+)"[^>]*>/i)
+      || html.match(/<img[^>]+src="([^"]+)"[^>]*alt="/i);
+
+    let author = jarInfo?.author || "";
+    let durationSec = jarInfo?.duration || 0;
+    let durationFormatted = "";
+    let date = "";
+
+    if (infoMatch) {
+      const parts = infoMatch[1].split(/&bull;|•/).map(p => p.trim());
+      if (!author) author = parts[0] || "";
+      durationFormatted = parts[1] || "";
+      date = parts[2] || "";
+    }
+
+    if (!durationSec && durationFormatted) {
+      const durParts = durationFormatted.split(":").map(Number);
+      if (durParts.length === 2) durationSec = durParts[0] * 60 + durParts[1];
+      else if (durParts.length === 3) durationSec = durParts[0] * 3600 + durParts[1] * 60 + durParts[2];
+    }
+
+    const origAudioSize = jarFormats?.audio?.size ? Math.round(jarFormats.audio.size) : null;
+    const origAudioSizeFormatted = jarFormats?.audio?.sizeLabel || (origAudioSize ? formatBytesNumber(origAudioSize) : null);
+
+    const audioBitrates = [
+      {
+        label: "MP3 Original",
+        quality: "original",
+        bitrate: "original",
+        size: origAudioSize,
+        size_formatted: origAudioSizeFormatted,
+        download_allowed: origAudioSize ? origAudioSize <= MAX_DOWNLOAD_BYTES : true,
+        download_url: `${origin}/api/download?id=${videoId}&type=audio&quality=original`,
+        stream_url: `${origin}/api/stream?id=${videoId}&type=audio&quality=original`
+      },
+      ...([320, 256, 192, 128, 64].map(b => {
+        const bSize = durationSec ? Math.round((b * 1000 * durationSec) / 8) : null;
+        return {
+          label: `MP3 ${b} Kbps`,
+          quality: `${b}kbps`,
+          bitrate: b,
+          size: bSize,
+          size_formatted: formatBitrateBytes(b, durationSec),
+          download_allowed: bSize ? bSize <= MAX_DOWNLOAD_BYTES : true,
+          download_url: `${origin}/api/download?id=${videoId}&type=audio&quality=${b}`,
+          stream_url: `${origin}/api/stream?id=${videoId}&type=audio&quality=${b}`
+        };
+      }))
+    ];
+
+    const ytmp3Videos = (jarFormats?.videos || []).map(v => {
+      const vSize = typeof v.size === "number" ? Math.round(v.size) : null;
+      return {
+        quality: v.quality,
+        size: vSize,
+        size_formatted: v.sizeLabel || formatBytesNumber(vSize),
+        download_allowed: vSize ? vSize <= MAX_DOWNLOAD_BYTES : true
+      };
+    });
+
+    const title = jarInfo?.title || (titleMatch ? titleMatch[1].trim() : "");
+    const thumbnail = jarInfo?.thumbnailUrl?.split("?")[0]
+      || (thumbMatch ? thumbMatch[1] : `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`);
+
+    return {
+      status: "active",
+      host: "ytmp3.biz.pl",
+      title,
+      author,
+      duration: durationSec || durationFormatted || 0,
+      duration_formatted: durationFormatted,
+      release_date: date,
+      thumbnail,
+      converter_url: iframeMatch ? iframeMatch[1] : `https://lil.sounddownmp3.com/ea.php?link=${videoId}`,
+      web_url: `https://ytmp3.biz.pl/?q=${encodeURIComponent(`https://www.youtube.com/watch?v=${videoId}`)}`,
+      audio: {
+        original: {
+          quality: "original",
+          size: origAudioSize,
+          size_formatted: origAudioSizeFormatted,
+          download_allowed: origAudioSize ? origAudioSize <= MAX_DOWNLOAD_BYTES : true
+        },
+        bitrates: audioBitrates
+      },
+      videos: ytmp3Videos,
+      raw_jar_formats: jarFormats
+    };
+  } catch {
+    return null;
+  }
+}
+
 async function fetchFromEdgeDownloader(videoId) {
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 12000);
+  const timer = setTimeout(() => controller.abort(), 28000);
   try {
     const target = `https://yt-dl.officialhectormanuel.workers.dev/?url=${encodeURIComponent(`https://www.youtube.com/watch?v=${videoId}`)}`;
     const res = await fetch(target, {
@@ -116,7 +293,7 @@ async function resolveFromSaveNow(videoId, cleanQuality, isAudio) {
   const format = isAudio ? "mp3" : cleanQuality;
   const target = `https://p.savenow.to/api/v2/download?format=${format}&url=${encodeURIComponent(`https://www.youtube.com/watch?v=${videoId}`)}`;
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 10000);
+  const timer = setTimeout(() => controller.abort(), 12000);
   try {
     const res = await fetch(target, {
       headers: { "User-Agent": "Mozilla/5.0" },
@@ -166,7 +343,7 @@ async function resolveMediaStream(videoId, requestedQuality, isAudio) {
 
   const snUrl = await resolveFromSaveNow(videoId, cleanQ, isAudio);
   if (snUrl) {
-    return { source: "engine-2", url: snUrl, quality: isAudio ? "mp3" : `${cleanQ}p` };
+    return { source: "engine-3", url: snUrl, quality: isAudio ? "mp3" : `${cleanQ}p` };
   }
 
   const itData = await fetchInnertube(videoId);
@@ -194,19 +371,21 @@ async function scrapeYouTube(videoId, requestedQuality, origin) {
     ? String(requestedQuality).replace("p", "")
     : "1080";
 
-  const [edgeResult, itResult, oembedResult, prexzyResult] = await Promise.allSettled([
+  const [edgeResult, ytmp3Result, itResult, oembedResult, prexzyResult] = await Promise.allSettled([
     fetchFromEdgeDownloader(videoId),
+    fetchYtMp3BizPl(videoId, origin),
     fetchInnertube(videoId),
     fetchOEmbed(videoId),
     fetchPrexzy(videoId)
   ]);
 
   const edgeData = edgeResult.status === "fulfilled" ? edgeResult.value : null;
+  const ytmp3Data = ytmp3Result.status === "fulfilled" ? ytmp3Result.value : null;
   const itData = itResult.status === "fulfilled" ? itResult.value : null;
   const oembed = oembedResult.status === "fulfilled" ? oembedResult.value : null;
   const prexzy = prexzyResult.status === "fulfilled" ? prexzyResult.value : null;
 
-  if (!edgeData && !itData && !oembed && !prexzy) {
+  if (!edgeData && !ytmp3Data && !itData && !oembed && !prexzy) {
     throw new Error("Unable to retrieve YouTube video data from available engines");
   }
 
@@ -214,12 +393,12 @@ async function scrapeYouTube(videoId, requestedQuality, origin) {
   const details = itData?.videoDetails || {};
   const streaming = itData?.streamingData || {};
 
-  const title = edgeData?.title || pInfo.title || details.title || oembed?.title || `youtube_${videoId}`;
+  const title = edgeData?.title || ytmp3Data?.title || pInfo.title || details.title || oembed?.title || `youtube_${videoId}`;
   const cleanTitle = sanitizeFilename(title);
 
-  const author = details.author || pInfo.channel || pInfo.uploader || oembed?.author_name || edgeData?.creator || "";
+  const author = ytmp3Data?.author || details.author || pInfo.channel || pInfo.uploader || oembed?.author_name || edgeData?.creator || "";
   const channelId = details.channelId || pInfo.id || "";
-  const duration = Number(details.lengthSeconds || pInfo.duration || 0);
+  const duration = Number(details.lengthSeconds || pInfo.duration || (typeof ytmp3Data?.duration === "number" ? ytmp3Data.duration : 0));
   const views = Number(details.viewCount || pInfo.view_count || 0);
   const isLive = Boolean(details.isLiveContent);
 
@@ -228,6 +407,26 @@ async function scrapeYouTube(videoId, requestedQuality, origin) {
   const bestAudio = audioFormats.find(f => f.audioQuality === "AUDIO_QUALITY_MEDIUM") || audioFormats[0] || null;
 
   const edgeVideos = edgeData?.videos || {};
+  const qualitiesMap = {};
+  const qualitiesList = [];
+  const jarVideos = ytmp3Data?.raw_jar_formats?.videos || ytmp3Data?.videos || [];
+
+  for (const [key, val] of Object.entries(edgeVideos)) {
+    const qLabel = key.endsWith("p") ? key : `${key}p`;
+    qualitiesMap[qLabel] = val;
+
+    const sizeInfo = findQualitySize(qLabel, jarVideos, itData);
+    qualitiesList.push({
+      quality: qLabel,
+      size: sizeInfo.size,
+      size_formatted: sizeInfo.size_formatted,
+      download_allowed: sizeInfo.size ? sizeInfo.size <= MAX_DOWNLOAD_BYTES : true,
+      url: val,
+      download_url: `${origin}/api/download?url=${encodeURIComponent(val)}&filename=${encodeURIComponent(cleanTitle + "_" + qLabel + ".mp4")}`,
+      stream_url: `${origin}/api/stream?url=${encodeURIComponent(val)}`
+    });
+  }
+
   const primaryVideoUrl = edgeVideos[cleanQ]
     || edgeVideos["1080"]
     || edgeVideos["720"]
@@ -239,26 +438,28 @@ async function scrapeYouTube(videoId, requestedQuality, origin) {
     || progFormat?.url
     || null;
 
-  const activeQuality = Object.keys(edgeVideos).find(k => edgeVideos[k] === primaryVideoUrl)
-    ? `${Object.keys(edgeVideos).find(k => edgeVideos[k] === primaryVideoUrl)}p`
-    : (progFormat?.qualityLabel || `${cleanQ}p`);
+  const activeQuality = edgeVideos[cleanQ]
+    ? `${cleanQ}p`
+    : (Object.keys(qualitiesMap)[0] || (progFormat?.qualityLabel || `${cleanQ}p`));
+
+  const primarySizeInfo = findQualitySize(activeQuality, jarVideos, itData);
+
+  const rawAudioSize = ytmp3Data?.audio?.original?.size
+    || (bestAudio?.contentLength ? Number(bestAudio.contentLength) : null);
+  const audioSizeFormatted = ytmp3Data?.audio?.original?.size_formatted
+    || (rawAudioSize ? formatBytesNumber(rawAudioSize) : null);
 
   const primaryAudioUrl = edgeData?.audio || bestAudio?.url || null;
 
-  const qualities = {};
-  for (const q of ["2160", "1440", "1080", "720", "480", "360", "240", "144"]) {
-    if (edgeVideos[q]) {
-      qualities[`${q}p`] = edgeVideos[q];
-    }
-  }
-
   const thumbnails = details.thumbnail?.thumbnails?.length
     ? details.thumbnail.thumbnails
-    : (pInfo.thumbnail
-      ? [{ url: pInfo.thumbnail, width: 480, height: 360 }]
-      : (edgeData?.thumbnail
-        ? [{ url: edgeData.thumbnail, width: 480, height: 360 }]
-        : [{ url: oembed?.thumbnail_url || `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`, width: 480, height: 360 }]));
+    : (ytmp3Data?.thumbnail
+      ? [{ url: ytmp3Data.thumbnail, width: 480, height: 360 }]
+      : (pInfo.thumbnail
+        ? [{ url: pInfo.thumbnail, width: 480, height: 360 }]
+        : (edgeData?.thumbnail
+          ? [{ url: edgeData.thumbnail, width: 480, height: 360 }]
+          : [{ url: oembed?.thumbnail_url || `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`, width: 480, height: 360 }])));
 
   const videoDownloadUrl = primaryVideoUrl
     ? `${origin}/api/download?url=${encodeURIComponent(primaryVideoUrl)}&filename=${encodeURIComponent(cleanTitle + "_" + cleanQ + "p.mp4")}`
@@ -276,39 +477,100 @@ async function scrapeYouTube(videoId, requestedQuality, origin) {
     ? `${origin}/api/stream?url=${encodeURIComponent(primaryAudioUrl)}`
     : `${origin}/api/stream?id=${videoId}&type=audio`;
 
+  const audioBitrates = ytmp3Data?.audio?.bitrates || [
+    { label: "Original", quality: "original", size: rawAudioSize, size_formatted: audioSizeFormatted, download_allowed: rawAudioSize ? rawAudioSize <= MAX_DOWNLOAD_BYTES : true, download_url: audioDownloadUrl, stream_url: audioStreamUrl },
+    { label: "320 Kbps", quality: "320kbps", bitrate: 320, size: duration ? Math.round(320 * 1000 * duration / 8) : null, size_formatted: formatBitrateBytes(320, duration), download_allowed: true, download_url: `${origin}/api/download?id=${videoId}&type=audio&quality=320`, stream_url: `${origin}/api/stream?id=${videoId}&type=audio&quality=320` },
+    { label: "256 Kbps", quality: "256kbps", bitrate: 256, size: duration ? Math.round(256 * 1000 * duration / 8) : null, size_formatted: formatBitrateBytes(256, duration), download_allowed: true, download_url: `${origin}/api/download?id=${videoId}&type=audio&quality=256`, stream_url: `${origin}/api/stream?id=${videoId}&type=audio&quality=256` },
+    { label: "192 Kbps", quality: "192kbps", bitrate: 192, size: duration ? Math.round(192 * 1000 * duration / 8) : null, size_formatted: formatBitrateBytes(192, duration), download_allowed: true, download_url: `${origin}/api/download?id=${videoId}&type=audio&quality=192`, stream_url: `${origin}/api/stream?id=${videoId}&type=audio&quality=192` },
+    { label: "128 Kbps", quality: "128kbps", bitrate: 128, size: duration ? Math.round(128 * 1000 * duration / 8) : null, size_formatted: formatBitrateBytes(128, duration), download_allowed: true, download_url: `${origin}/api/download?id=${videoId}&type=audio&quality=128`, stream_url: `${origin}/api/stream?id=${videoId}&type=audio&quality=128` },
+    { label: "64 Kbps", quality: "64kbps", bitrate: 64, size: duration ? Math.round(64 * 1000 * duration / 8) : null, size_formatted: formatBitrateBytes(64, duration), download_allowed: true, download_url: `${origin}/api/download?id=${videoId}&type=audio&quality=64`, stream_url: `${origin}/api/stream?id=${videoId}&type=audio&quality=64` }
+  ];
+
+  const ytmp3CleanVideos = (ytmp3Data?.videos || []).map(v => ({
+    quality: v.quality,
+    size: v.size,
+    size_formatted: v.size_formatted,
+    download_allowed: v.download_allowed
+  }));
+
   return {
-    engine: edgeData ? "engine-1 (edge-ytdl)" : (itData ? "fallback (innertube)" : "engine-2 (savenow)"),
+    engine: edgeData ? "engine-1 (edge-ytdl)" : (ytmp3Data ? "engine-2 (ytmp3)" : "engine-3 (savenow)"),
     id: videoId,
     title,
     channel: {
       id: channelId,
       name: author
     },
-    duration,
+    duration: duration || ytmp3Data?.duration || 0,
     views,
     is_live: isLive,
     thumbnails,
+    max_download_size: MAX_DOWNLOAD_BYTES,
+    max_download_size_formatted: "650 MB",
     requested_quality: `${cleanQ}p`,
     available_qualities: edgeData?.available_qualities || ["1080p", "720p", "480p", "360p", "mp3"],
     engines: {
-      active: edgeData ? "engine-1" : (itData ? "fallback" : "engine-2"),
+      active: edgeData ? "engine-1" : (ytmp3Data ? "engine-2" : "engine-3"),
       engine_1: "yt-dl.officialhectormanuel.workers.dev",
-      engine_2: "p.savenow.to",
+      engine_2: "ytmp3.biz.pl",
+      engine_3: "p.savenow.to",
       fallback: "innertube-android"
+    },
+    sources: {
+      edge_downloader: edgeData ? {
+        status: "active",
+        host: "yt-dl.officialhectormanuel.workers.dev",
+        title: edgeData.title,
+        audio: edgeData.audio,
+        audio_size: rawAudioSize,
+        audio_size_formatted: audioSizeFormatted,
+        videos: qualitiesMap,
+        videos_detailed: qualitiesList,
+        available_qualities: edgeData.available_qualities
+      } : {
+        status: "offline",
+        host: "yt-dl.officialhectormanuel.workers.dev"
+      },
+      ytmp3_biz_pl: ytmp3Data ? {
+        status: "active",
+        host: "ytmp3.biz.pl",
+        title: ytmp3Data.title,
+        author: ytmp3Data.author,
+        duration: ytmp3Data.duration,
+        duration_formatted: ytmp3Data.duration_formatted,
+        release_date: ytmp3Data.release_date,
+        thumbnail: ytmp3Data.thumbnail,
+        converter_url: ytmp3Data.converter_url,
+        web_url: ytmp3Data.web_url,
+        audio: ytmp3Data.audio,
+        videos: ytmp3CleanVideos
+      } : {
+        status: "offline",
+        host: "ytmp3.biz.pl"
+      }
     },
     media: {
       video: {
         quality: activeQuality,
+        size: primarySizeInfo.size,
+        size_formatted: primarySizeInfo.size_formatted,
+        download_allowed: primarySizeInfo.size ? primarySizeInfo.size <= MAX_DOWNLOAD_BYTES : true,
         url: primaryVideoUrl || videoDownloadUrl,
-        qualities: Object.keys(qualities).length ? qualities : null,
+        qualities: qualitiesList.length ? qualitiesList : null,
+        qualities_map: Object.keys(qualitiesMap).length ? qualitiesMap : null,
         download_url: videoDownloadUrl,
         stream_url: videoStreamUrl
       },
       audio: {
         format: edgeData?.audio ? "mp3" : "m4a",
+        quality: "original",
+        size: rawAudioSize,
+        size_formatted: audioSizeFormatted,
+        download_allowed: rawAudioSize ? rawAudioSize <= MAX_DOWNLOAD_BYTES : true,
         url: primaryAudioUrl || audioDownloadUrl,
         download_url: audioDownloadUrl,
-        stream_url: audioStreamUrl
+        stream_url: audioStreamUrl,
+        bitrates: audioBitrates
       }
     }
   };
@@ -329,13 +591,25 @@ async function pipeStream(targetUrl, request, filename, asAttachment) {
     headers: upstreamHeaders
   });
 
+  const contentLength = upstream.headers.get("content-length");
+  if (asAttachment && contentLength && Number(contentLength) > MAX_DOWNLOAD_BYTES) {
+    return json({
+      status: "error",
+      code: 413,
+      message: "File size exceeds the 650 MB download limit",
+      file_size: Number(contentLength),
+      file_size_formatted: formatBytesNumber(Number(contentLength)),
+      max_download_size: MAX_DOWNLOAD_BYTES,
+      max_download_size_formatted: "650 MB"
+    }, 413);
+  }
+
   const responseHeaders = new Headers(CORS_HEADERS);
   const isAudioFile = filename.endsWith(".mp3") || filename.endsWith(".m4a");
   const fallbackType = isAudioFile ? (filename.endsWith(".mp3") ? "audio/mpeg" : "audio/mp4") : "video/mp4";
   const contentType = upstream.headers.get("content-type") || fallbackType;
   responseHeaders.set("Content-Type", contentType);
 
-  const contentLength = upstream.headers.get("content-length");
   if (contentLength) responseHeaders.set("Content-Length", contentLength);
 
   const contentRange = upstream.headers.get("content-range");
@@ -350,7 +624,23 @@ async function pipeStream(targetUrl, request, filename, asAttachment) {
   );
   responseHeaders.set("Cache-Control", "public, max-age=86400");
 
-  return new Response(upstream.body, {
+  let body = upstream.body;
+  if (asAttachment) {
+    let bytesTransferred = 0;
+    const limiter = new TransformStream({
+      transform(chunk, controller) {
+        bytesTransferred += chunk.length;
+        if (bytesTransferred > MAX_DOWNLOAD_BYTES) {
+          controller.error(new Error("File size exceeds 650 MB limit"));
+        } else {
+          controller.enqueue(chunk);
+        }
+      }
+    });
+    body = body.pipeThrough(limiter);
+  }
+
+  return new Response(body, {
     status: upstream.status,
     headers: responseHeaders
   });
@@ -392,7 +682,9 @@ async function handleProxy(request, asAttachment) {
     if (resolved && resolved.url) {
       try {
         return await pipeStream(resolved.url, request, filename, asAttachment);
-      } catch {}
+      } catch (err) {
+        return json({ status: "error", message: `Stream error: ${err.message}` }, 500);
+      }
     }
   }
 
@@ -416,10 +708,15 @@ export default {
       return json({
         status: "online",
         service: "YouTube Scraper & Downloader API",
-        version: "2.1.0",
+        version: "2.4.0",
+        limits: {
+          max_download_size: MAX_DOWNLOAD_BYTES,
+          max_download_size_formatted: "650 MB"
+        },
         engines: [
           { name: "engine-1", host: "yt-dl.officialhectormanuel.workers.dev", status: "active" },
-          { name: "engine-2", host: "p.savenow.to", status: "standby" },
+          { name: "engine-2", host: "ytmp3.biz.pl", status: "active" },
+          { name: "engine-3", host: "p.savenow.to", status: "standby" },
           { name: "fallback", host: "youtubei.googleapis.com", status: "standby" }
         ],
         endpoints: {
@@ -438,10 +735,11 @@ export default {
             params: {
               url: "Direct stream URL returned in scrape response",
               id: "11-char YouTube video ID",
-              quality: "Resolution: 1080, 720, 480, 360",
+              quality: "Resolution: 1080, 720, 480, 360 or bitrate: 320, 256, 192, 128, 64",
               type: "Media type: video or audio (default: video)",
               filename: "Optional custom output filename"
             },
+            notes: "Files larger than 650 MB cannot be downloaded via proxy",
             example: `${origin}/api/download?id=dQw4w9WgXcQ&quality=720&type=video`
           },
           stream: {
@@ -450,7 +748,7 @@ export default {
             params: {
               url: "Direct stream URL returned in scrape response",
               id: "11-char YouTube video ID",
-              quality: "Resolution: 1080, 720, 480, 360",
+              quality: "Resolution: 1080, 720, 480, 360 or bitrate",
               type: "Media type: video or audio (default: video)"
             },
             example: `${origin}/api/stream?id=dQw4w9WgXcQ&quality=720`
