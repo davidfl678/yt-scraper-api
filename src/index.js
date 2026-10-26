@@ -56,11 +56,15 @@ async function fetchInnertube(videoId) {
   return data;
 }
 
-async function fetchThirdParty(ytUrl) {
+async function fetchThirdParty(ytUrl, requestedQuality) {
   const mirrors = [
     "https://rue-cobalt.xenon.zone",
     "https://cobaltapi.cjs.nz"
   ];
+
+  const targetQuality = ["360", "480", "720", "1080", "1440", "2160"].includes(String(requestedQuality))
+    ? String(requestedQuality)
+    : "1080";
 
   for (const mirror of mirrors) {
     try {
@@ -74,7 +78,7 @@ async function fetchThirdParty(ytUrl) {
             "Accept": "application/json",
             "Content-Type": "application/json"
           },
-          body: JSON.stringify({ url: ytUrl, videoQuality: "720" }),
+          body: JSON.stringify({ url: ytUrl, videoQuality: targetQuality }),
           signal: controller.signal
         }),
         fetch(`${mirror}/`, {
@@ -110,6 +114,7 @@ async function fetchThirdParty(ytUrl) {
       if (videoUrl || audioUrl) {
         return {
           mirror,
+          quality: `${targetQuality}p`,
           videoUrl,
           audioUrl
         };
@@ -120,12 +125,12 @@ async function fetchThirdParty(ytUrl) {
   return null;
 }
 
-async function scrapeYouTube(videoId, origin) {
+async function scrapeYouTube(videoId, requestedQuality, origin) {
   const ytUrl = `https://www.youtube.com/watch?v=${videoId}`;
 
   const [innertubeResult, thirdPartyResult] = await Promise.allSettled([
     fetchInnertube(videoId),
-    fetchThirdParty(ytUrl)
+    fetchThirdParty(ytUrl, requestedQuality)
   ]);
 
   if (innertubeResult.status !== "fulfilled") {
@@ -149,6 +154,7 @@ async function scrapeYouTube(videoId, origin) {
 
   const primaryVideoDownload = hdVideoUrl || directMp4Url;
   const primaryAudioDownload = mp3Url || directAudioUrl;
+  const activeQuality = tp?.quality || (progFormat?.qualityLabel || "360p");
 
   const thumbnails = details.thumbnail?.thumbnails || [
     { url: `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`, width: 480, height: 360 }
@@ -166,13 +172,14 @@ async function scrapeYouTube(videoId, origin) {
     views: Number(details.viewCount || 0),
     is_live: Boolean(details.isLiveContent),
     thumbnails,
+    available_qualities: ["1080p", "720p", "480p", "360p", "mp3"],
     media: {
       video: {
-        quality: hdVideoUrl ? "720p (HD)" : (progFormat?.qualityLabel || "360p"),
+        quality: activeQuality,
         url: primaryVideoDownload,
-        fallback_url: directMp4Url,
+        fallback_360p_url: directMp4Url,
         download_url: primaryVideoDownload
-          ? `${origin}/api/download?url=${encodeURIComponent(primaryVideoDownload)}&filename=youtube_${videoId}.mp4`
+          ? `${origin}/api/download?url=${encodeURIComponent(primaryVideoDownload)}&filename=youtube_${videoId}_${activeQuality}.mp4`
           : null,
         stream_url: (directMp4Url || primaryVideoDownload)
           ? `${origin}/api/stream?url=${encodeURIComponent(directMp4Url || primaryVideoDownload)}`
@@ -272,15 +279,16 @@ export default {
       return json({
         status: "online",
         service: "YouTube Scraper & Downloader API",
-        version: "1.0.0",
+        version: "1.1.0",
         endpoints: {
           scrape: {
             method: ["GET", "POST"],
             path: "/api/scrape",
             params: {
-              url: "YouTube video URL (watch/shorts/youtu.be) or 11-char video ID"
+              url: "YouTube video URL (watch/shorts/youtu.be) or 11-char video ID",
+              quality: "Optional video resolution: 1080, 720, 480, 360 (default: 1080)"
             },
-            example: `${origin}/api/scrape?url=https://www.youtube.com/watch?v=dQw4w9WgXcQ`
+            example: `${origin}/api/scrape?url=https://www.youtube.com/watch?v=dQw4w9WgXcQ&quality=1080`
           },
           download: {
             method: "GET",
@@ -319,21 +327,25 @@ export default {
 
     if (["/api/scrape", "/scrape", "/api/video", "/api/info"].includes(path)) {
       let rawInput = null;
+      let requestedQuality = "1080";
 
       if (request.method === "GET") {
         rawInput = url.searchParams.get("url") || url.searchParams.get("id");
+        requestedQuality = url.searchParams.get("quality") || url.searchParams.get("q") || "1080";
       } else if (request.method === "POST") {
         const contentType = request.headers.get("content-type") || "";
         if (contentType.includes("application/json")) {
           try {
             const body = await request.json();
             rawInput = body.url || body.id || body.link;
+            requestedQuality = body.quality || body.q || "1080";
           } catch {
             return json({ status: "error", message: "Invalid JSON body" }, 400);
           }
         } else if (contentType.includes("application/x-www-form-urlencoded")) {
           const form = await request.formData();
           rawInput = form.get("url") || form.get("id") || form.get("link");
+          requestedQuality = form.get("quality") || form.get("q") || "1080";
         }
       } else {
         return json({ status: "error", message: "Method not allowed" }, 405);
@@ -348,7 +360,7 @@ export default {
       }
 
       try {
-        const data = await scrapeYouTube(videoId, origin);
+        const data = await scrapeYouTube(videoId, requestedQuality, origin);
         return json({
           status: "success",
           code: 200,
