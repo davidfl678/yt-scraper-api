@@ -5,10 +5,10 @@ const CORS_HEADERS = {
   "Access-Control-Expose-Headers": "Content-Length, Content-Range, Content-Disposition"
 };
 
-const THIRD_PARTY_MIRRORS = [
-  { name: "mirror-1", base: "https://cobaltapi.cjs.nz" },
-  { name: "mirror-2", base: "https://rue-cobalt.xenon.zone" },
-  { name: "mirror-3", base: "https://p.savenow.to" }
+const ENGINES = [
+  { name: "engine-1", host: "yt-dl.officialhectormanuel.workers.dev" },
+  { name: "engine-2", host: "p.savenow.to" },
+  { name: "fallback", host: "youtubei.googleapis.com" }
 ];
 
 function json(data, status = 200) {
@@ -67,38 +67,20 @@ async function fetchInnertube(videoId) {
   return data;
 }
 
-async function resolveFromCobalt(mirrorBase, videoId, cleanQuality, isAudio) {
+async function fetchFromEdgeDownloader(videoId) {
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 4500);
-
-  const payload = {
-    url: `https://www.youtube.com/watch?v=${videoId}`,
-    youtubeVideoCodec: "h264"
-  };
-
-  if (isAudio) {
-    payload.downloadMode = "audio";
-    payload.audioFormat = "mp3";
-  } else {
-    payload.videoQuality = cleanQuality;
-  }
-
+  const timer = setTimeout(() => controller.abort(), 26000);
   try {
-    const res = await fetch(`${mirrorBase}/`, {
-      method: "POST",
-      headers: {
-        "Accept": "application/json",
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify(payload),
+    const target = `https://yt-dl.officialhectormanuel.workers.dev/?url=${encodeURIComponent(`https://www.youtube.com/watch?v=${videoId}`)}`;
+    const res = await fetch(target, {
+      headers: { "Accept": "application/json", "User-Agent": "Mozilla/5.0" },
       signal: controller.signal
     });
     clearTimeout(timer);
-
     if (!res.ok) return null;
     const data = await res.json();
-    if (data && (data.status === "tunnel" || data.status === "redirect") && data.url) {
-      return data.url;
+    if (data && data.status && (data.videos || data.audio)) {
+      return data;
     }
   } catch {
     clearTimeout(timer);
@@ -108,12 +90,11 @@ async function resolveFromCobalt(mirrorBase, videoId, cleanQuality, isAudio) {
 
 async function resolveFromSaveNow(videoId, cleanQuality, isAudio) {
   const format = isAudio ? "mp3" : cleanQuality;
-  const url = `https://p.savenow.to/ajax/download.php?format=${format}&url=${encodeURIComponent(`https://www.youtube.com/watch?v=${videoId}`)}`;
+  const target = `https://p.savenow.to/api/v2/download?format=${format}&url=${encodeURIComponent(`https://www.youtube.com/watch?v=${videoId}`)}`;
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 4000);
-
+  const timer = setTimeout(() => controller.abort(), 8000);
   try {
-    const res = await fetch(url, {
+    const res = await fetch(target, {
       headers: { "User-Agent": "Mozilla/5.0" },
       signal: controller.signal
     });
@@ -122,9 +103,11 @@ async function resolveFromSaveNow(videoId, cleanQuality, isAudio) {
     const data = await res.json();
     if (data?.url) return data.url;
     if (data?.progress_url) {
-      for (let i = 0; i < 4; i++) {
-        await new Promise(r => setTimeout(r, 600));
-        const pRes = await fetch(data.progress_url, { headers: { "User-Agent": "Mozilla/5.0" } });
+      for (let i = 0; i < 6; i++) {
+        await new Promise(r => setTimeout(r, 800));
+        const pRes = await fetch(data.progress_url, {
+          headers: { "User-Agent": "Mozilla/5.0" }
+        });
         if (pRes.ok) {
           const pData = await pRes.json();
           if (pData?.success === 1 && pData?.download_url) {
@@ -140,18 +123,26 @@ async function resolveFromSaveNow(videoId, cleanQuality, isAudio) {
 }
 
 async function resolveMediaStream(videoId, requestedQuality, isAudio) {
-  const cleanQ = ["360", "480", "720", "1080", "1440", "2160"].includes(String(requestedQuality).replace("p", ""))
+  const cleanQ = ["144", "240", "360", "480", "720", "1080", "1440", "2160"].includes(String(requestedQuality).replace("p", ""))
     ? String(requestedQuality).replace("p", "")
     : "1080";
 
-  for (const mirror of THIRD_PARTY_MIRRORS) {
-    if (mirror.base.includes("savenow.to")) {
-      const url = await resolveFromSaveNow(videoId, cleanQ, isAudio);
-      if (url) return { source: mirror.name, url, quality: `${cleanQ}p` };
-    } else {
-      const url = await resolveFromCobalt(mirror.base, videoId, cleanQ, isAudio);
-      if (url) return { source: mirror.name, url, quality: `${cleanQ}p` };
+  const edgeData = await fetchFromEdgeDownloader(videoId);
+  if (edgeData) {
+    if (isAudio && edgeData.audio) {
+      return { source: "engine-1", url: edgeData.audio, quality: "mp3" };
     }
+    const videos = edgeData.videos || {};
+    const url = videos[cleanQ] || videos["1080"] || videos["720"] || videos["480"] || videos["360"] || videos["240"] || videos["144"] || Object.values(videos)[0];
+    if (url) {
+      const foundQ = Object.keys(videos).find(k => videos[k] === url) || cleanQ;
+      return { source: "engine-1", url, quality: `${foundQ}p` };
+    }
+  }
+
+  const snUrl = await resolveFromSaveNow(videoId, cleanQ, isAudio);
+  if (snUrl) {
+    return { source: "engine-2", url: snUrl, quality: isAudio ? "mp3" : `${cleanQ}p` };
   }
 
   try {
@@ -161,12 +152,12 @@ async function resolveMediaStream(videoId, requestedQuality, isAudio) {
       const audioFormats = (streaming.adaptiveFormats || []).filter(f => f.mimeType?.startsWith("audio/"));
       const bestAudio = audioFormats.find(f => f.audioQuality === "AUDIO_QUALITY_MEDIUM") || audioFormats[0] || null;
       if (bestAudio?.url) {
-        return { source: "innertube-android", url: bestAudio.url, quality: "m4a" };
+        return { source: "fallback", url: bestAudio.url, quality: "m4a" };
       }
     } else {
       const progFormat = streaming.formats?.[0] || null;
       if (progFormat?.url) {
-        return { source: "innertube-android", url: progFormat.url, quality: progFormat.qualityLabel || "360p" };
+        return { source: "fallback", url: progFormat.url, quality: progFormat.qualityLabel || "360p" };
       }
     }
   } catch {}
@@ -174,104 +165,113 @@ async function resolveMediaStream(videoId, requestedQuality, isAudio) {
   return null;
 }
 
-async function fetchThirdPartyBatch(videoId, cleanQuality) {
-  for (const mirror of THIRD_PARTY_MIRRORS) {
-    if (mirror.base.includes("savenow.to")) {
-      continue;
-    }
-    try {
-      const [videoUrl, audioUrl] = await Promise.all([
-        resolveFromCobalt(mirror.base, videoId, cleanQuality, false),
-        resolveFromCobalt(mirror.base, videoId, cleanQuality, true)
-      ]);
-      if (videoUrl || audioUrl) {
-        return {
-          mirror: mirror.name,
-          base: mirror.base,
-          quality: `${cleanQuality}p`,
-          videoUrl,
-          audioUrl
-        };
-      }
-    } catch {}
-  }
-  return null;
-}
-
 async function scrapeYouTube(videoId, requestedQuality, origin) {
-  const cleanQ = ["360", "480", "720", "1080", "1440", "2160"].includes(String(requestedQuality).replace("p", ""))
+  const cleanQ = ["144", "240", "360", "480", "720", "1080", "1440", "2160"].includes(String(requestedQuality).replace("p", ""))
     ? String(requestedQuality).replace("p", "")
     : "1080";
 
-  const [innertubeResult, thirdPartyResult] = await Promise.allSettled([
-    fetchInnertube(videoId),
-    fetchThirdPartyBatch(videoId, cleanQ)
+  const [edgeResult, itResult] = await Promise.allSettled([
+    fetchFromEdgeDownloader(videoId),
+    fetchInnertube(videoId)
   ]);
 
-  if (innertubeResult.status !== "fulfilled") {
-    throw new Error(innertubeResult.reason?.message || "Failed to extract YouTube video");
+  const edgeData = edgeResult.status === "fulfilled" ? edgeResult.value : null;
+  const itData = itResult.status === "fulfilled" ? itResult.value : null;
+
+  if (!edgeData && !itData) {
+    throw new Error("Unable to retrieve YouTube video data from available engines");
   }
 
-  const itData = innertubeResult.value;
-  const details = itData.videoDetails || {};
-  const streaming = itData.streamingData || {};
+  const details = itData?.videoDetails || {};
+  const streaming = itData?.streamingData || {};
+
+  const title = edgeData?.title || details.title || `youtube_${videoId}`;
+  const cleanTitle = sanitizeFilename(title);
 
   const progFormat = streaming.formats?.[0] || null;
   const audioFormats = (streaming.adaptiveFormats || []).filter(f => f.mimeType?.startsWith("audio/"));
   const bestAudio = audioFormats.find(f => f.audioQuality === "AUDIO_QUALITY_MEDIUM") || audioFormats[0] || null;
 
-  const tp = thirdPartyResult.status === "fulfilled" ? thirdPartyResult.value : null;
+  const edgeVideos = edgeData?.videos || {};
+  const primaryVideoUrl = edgeVideos[cleanQ]
+    || edgeVideos["1080"]
+    || edgeVideos["720"]
+    || edgeVideos["480"]
+    || edgeVideos["360"]
+    || edgeVideos["240"]
+    || edgeVideos["144"]
+    || Object.values(edgeVideos)[0]
+    || progFormat?.url
+    || null;
 
-  const hdVideoUrl = tp?.videoUrl || null;
-  const directMp4Url = progFormat?.url || null;
-  const mp3Url = tp?.audioUrl || null;
-  const directAudioUrl = bestAudio?.url || null;
+  const activeQuality = Object.keys(edgeVideos).find(k => edgeVideos[k] === primaryVideoUrl)
+    ? `${Object.keys(edgeVideos).find(k => edgeVideos[k] === primaryVideoUrl)}p`
+    : (progFormat?.qualityLabel || `${cleanQ}p`);
 
-  const primaryVideoDownload = hdVideoUrl || directMp4Url;
-  const primaryAudioDownload = mp3Url || directAudioUrl;
-  const activeQuality = tp?.quality || (progFormat?.qualityLabel || "360p");
+  const primaryAudioUrl = edgeData?.audio || bestAudio?.url || null;
 
-  const cleanTitle = sanitizeFilename(details.title || `youtube_${videoId}`);
+  const qualities = {};
+  for (const q of ["2160", "1440", "1080", "720", "480", "360", "240", "144"]) {
+    if (edgeVideos[q]) {
+      qualities[`${q}p`] = edgeVideos[q];
+    }
+  }
 
-  const thumbnails = details.thumbnail?.thumbnails || [
-    { url: `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`, width: 480, height: 360 }
-  ];
+  const thumbnails = details.thumbnail?.thumbnails?.length
+    ? details.thumbnail.thumbnails
+    : edgeData?.thumbnail
+      ? [{ url: edgeData.thumbnail, width: 480, height: 360 }]
+      : [{ url: `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`, width: 480, height: 360 }];
+
+  const videoDownloadUrl = primaryVideoUrl
+    ? `${origin}/api/download?url=${encodeURIComponent(primaryVideoUrl)}&filename=${encodeURIComponent(cleanTitle + "_" + cleanQ + "p.mp4")}`
+    : `${origin}/api/download?id=${videoId}&quality=${cleanQ}&type=video&filename=${encodeURIComponent(cleanTitle + "_" + cleanQ + "p.mp4")}`;
+
+  const videoStreamUrl = primaryVideoUrl
+    ? `${origin}/api/stream?url=${encodeURIComponent(primaryVideoUrl)}`
+    : `${origin}/api/stream?id=${videoId}&quality=${cleanQ}&type=video`;
+
+  const audioDownloadUrl = primaryAudioUrl
+    ? `${origin}/api/download?url=${encodeURIComponent(primaryAudioUrl)}&filename=${encodeURIComponent(cleanTitle + "_audio." + (edgeData?.audio ? "mp3" : "m4a"))}`
+    : `${origin}/api/download?id=${videoId}&type=audio&filename=${encodeURIComponent(cleanTitle + "_audio." + (edgeData?.audio ? "mp3" : "m4a"))}`;
+
+  const audioStreamUrl = primaryAudioUrl
+    ? `${origin}/api/stream?url=${encodeURIComponent(primaryAudioUrl)}`
+    : `${origin}/api/stream?id=${videoId}&type=audio`;
 
   return {
-    engine: tp ? `hybrid (${tp.mirror})` : "youtube_innertube",
+    engine: edgeData ? "engine-1 (edge-ytdl)" : "fallback (innertube)",
     id: videoId,
-    title: details.title || "",
+    title,
     channel: {
       id: details.channelId || "",
-      name: details.author || ""
+      name: details.author || edgeData?.creator || ""
     },
     duration: Number(details.lengthSeconds || 0),
     views: Number(details.viewCount || 0),
     is_live: Boolean(details.isLiveContent),
     thumbnails,
     requested_quality: `${cleanQ}p`,
-    available_qualities: ["1080p", "720p", "480p", "360p", "mp3"],
-    mirrors: {
-      active: tp ? tp.mirror : "innertube-android",
-      mirror_1: "cobaltapi.cjs.nz",
-      mirror_2: "rue-cobalt.xenon.zone",
-      mirror_3: "p.savenow.to",
+    available_qualities: edgeData?.available_qualities || ["1080p", "720p", "480p", "360p", "mp3"],
+    engines: {
+      active: edgeData ? "engine-1" : "fallback",
+      engine_1: "yt-dl.officialhectormanuel.workers.dev",
+      engine_2: "p.savenow.to",
       fallback: "innertube-android"
     },
     media: {
       video: {
         quality: activeQuality,
-        url: primaryVideoDownload,
-        fallback_360p_url: directMp4Url,
-        download_url: `${origin}/api/download?id=${videoId}&quality=${cleanQ}&type=video&filename=${encodeURIComponent(cleanTitle + "_" + cleanQ + "p.mp4")}`,
-        stream_url: `${origin}/api/stream?id=${videoId}&quality=${cleanQ}&type=video`
+        url: primaryVideoUrl,
+        qualities: Object.keys(qualities).length ? qualities : null,
+        download_url: videoDownloadUrl,
+        stream_url: videoStreamUrl
       },
       audio: {
-        format: mp3Url ? "mp3" : "m4a",
-        url: primaryAudioDownload,
-        fallback_url: directAudioUrl,
-        download_url: `${origin}/api/download?id=${videoId}&type=audio&filename=${encodeURIComponent(cleanTitle + "_audio." + (mp3Url ? "mp3" : "m4a"))}`,
-        stream_url: `${origin}/api/stream?id=${videoId}&type=audio`
+        format: edgeData?.audio ? "mp3" : "m4a",
+        url: primaryAudioUrl,
+        download_url: audioDownloadUrl,
+        stream_url: audioStreamUrl
       }
     }
   };
@@ -279,7 +279,7 @@ async function scrapeYouTube(videoId, requestedQuality, origin) {
 
 async function pipeStream(targetUrl, request, filename, asAttachment) {
   const upstreamHeaders = {
-    "User-Agent": "com.google.android.youtube/20.34.37 (Linux; U; Android 11) gzip"
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
   };
 
   const range = request.headers.get("range");
@@ -323,6 +323,20 @@ async function handleProxy(request, asAttachment) {
   const reqUrl = new URL(request.url);
   const rawId = reqUrl.searchParams.get("id");
   const rawUrl = reqUrl.searchParams.get("url");
+
+  if (rawUrl && /^https?:\/\//i.test(rawUrl)) {
+    const isDirectMedia = !rawUrl.includes("youtube.com/") && !rawUrl.includes("youtu.be/");
+    if (isDirectMedia) {
+      try {
+        const parsedTarget = new URL(rawUrl);
+        const filename = reqUrl.searchParams.get("filename") || (parsedTarget.pathname.endsWith(".mp3") ? "youtube_audio.mp3" : "youtube_video.mp4");
+        return await pipeStream(parsedTarget.toString(), request, sanitizeFilename(filename), asAttachment);
+      } catch (err) {
+        return json({ status: "error", message: `Proxy error: ${err.message}` }, 502);
+      }
+    }
+  }
+
   const videoId = rawId || extractVideoId(rawUrl);
   const quality = reqUrl.searchParams.get("quality") || reqUrl.searchParams.get("q") || "1080";
   const type = reqUrl.searchParams.get("type") || "video";
@@ -345,20 +359,7 @@ async function handleProxy(request, asAttachment) {
     }
   }
 
-  if (rawUrl) {
-    let parsedTarget;
-    try {
-      parsedTarget = new URL(rawUrl);
-      if (!["http:", "https:"].includes(parsedTarget.protocol)) {
-        throw new Error("Invalid protocol");
-      }
-      return await pipeStream(parsedTarget.toString(), request, filename, asAttachment);
-    } catch (err) {
-      return json({ status: "error", message: `Proxy error: ${err.message}` }, 502);
-    }
-  }
-
-  return json({ status: "error", message: "Missing video 'id' or 'url' parameter" }, 400);
+  return json({ status: "error", message: "Missing valid video 'id' or media 'url' parameter" }, 400);
 }
 
 export default {
@@ -378,11 +379,10 @@ export default {
       return json({
         status: "online",
         service: "YouTube Scraper & Downloader API",
-        version: "2.0.0",
-        mirrors: [
-          { name: "mirror-1", host: "cobaltapi.cjs.nz", status: "active" },
-          { name: "mirror-2", host: "rue-cobalt.xenon.zone", status: "active" },
-          { name: "mirror-3", host: "p.savenow.to", status: "standby" },
+        version: "2.1.0",
+        engines: [
+          { name: "engine-1", host: "yt-dl.officialhectormanuel.workers.dev", status: "active" },
+          { name: "engine-2", host: "p.savenow.to", status: "standby" },
           { name: "fallback", host: "youtubei.googleapis.com", status: "standby" }
         ],
         endpoints: {
@@ -399,6 +399,7 @@ export default {
             method: "GET",
             path: "/api/download",
             params: {
+              url: "Direct stream URL returned in scrape response",
               id: "11-char YouTube video ID",
               quality: "Resolution: 1080, 720, 480, 360",
               type: "Media type: video or audio (default: video)",
@@ -410,6 +411,7 @@ export default {
             method: "GET",
             path: "/api/stream",
             params: {
+              url: "Direct stream URL returned in scrape response",
               id: "11-char YouTube video ID",
               quality: "Resolution: 1080, 720, 480, 360",
               type: "Media type: video or audio (default: video)"
